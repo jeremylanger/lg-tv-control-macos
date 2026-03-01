@@ -158,6 +158,12 @@ function LGTVController:log_init()
 end
 
 -- Event Handlers
+function LGTVController:ping_tv()
+    local ping_cmd = "ping -c 1 -W 3000 " .. config.tv_ip .. " > /dev/null 2>&1"
+    log_debug("Pinging TV to wake network interface...")
+    hs.execute(ping_cmd)
+end
+
 function LGTVController:handle_wake_event()
     local current_time = os.time()
     if current_time - self.last_wake_execution < config.debounce_seconds then
@@ -177,9 +183,19 @@ function LGTVController:handle_wake_event()
         log_debug("Wake on LAN packet sent to " .. config.tv_mac_address)
     end
 
+    -- Ping TV to wake its network interface and populate ARP cache.
+    -- LG TVs in standby have slow network response, causing "No route to host"
+    -- errors if the WebSocket connection is attempted too soon.
+    self:ping_tv()
+
     if self:execute_command("turn_screen_on") then
         log_debug("TV screen turned on")
     end
+
+    -- Wait for the TV to fully power on and complete HDMI handshake
+    -- before switching input. Without this delay, the TV may show
+    -- "NO INPUT" because the HDMI link isn't established yet.
+    hs.timer.usleep(3000000) -- 3 seconds
 
     if self:current_app_id() ~= config.app_id and config.switch_input_on_wake then
         if self:execute_command("launch_app " .. config.app_id) then
@@ -258,15 +274,17 @@ function LGTVController:setup_watchers()
             return
         end
 
-        if self:is_connected() then
-            if eventType == hs.caffeinate.watcher.screensDidWake or
-               eventType == hs.caffeinate.watcher.systemDidWake or
-               eventType == hs.caffeinate.watcher.screensDidUnlock then
-                self:handle_wake_event()
-            elseif eventType == hs.caffeinate.watcher.screensDidSleep or
-                   eventType == hs.caffeinate.watcher.systemWillPowerOff then
-                self:handle_sleep_event()
-            end
+        -- Wake events run without checking is_connected() because during
+        -- clamshell wake, the HDMI display link hasn't been negotiated yet
+        -- and hs.screen.find() won't find the TV.
+        if eventType == hs.caffeinate.watcher.screensDidWake or
+           eventType == hs.caffeinate.watcher.systemDidWake or
+           eventType == hs.caffeinate.watcher.screensDidUnlock then
+            self:handle_wake_event()
+        elseif (eventType == hs.caffeinate.watcher.screensDidSleep or
+                eventType == hs.caffeinate.watcher.systemWillPowerOff) and
+               self:is_connected() then
+            self:handle_sleep_event()
         end
     end)
 
