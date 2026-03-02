@@ -61,6 +61,7 @@ function LGTVController:new()
     obj.bin_cmd = config.bin_path .. " -p " .. config.key_file_path .. " " .. config.tv_ip .. " "
     obj.last_wake_execution = 0
     obj.last_sleep_execution = 0
+    obj.tv_was_connected = obj:is_connected()
     return obj
 end
 
@@ -274,18 +275,35 @@ function LGTVController:setup_watchers()
             return
         end
 
-        -- Skip is_connected() for both wake and sleep events because
-        -- during clamshell transitions, the HDMI display link may not be
-        -- visible to hs.screen.find() — it hasn't been negotiated yet on
-        -- wake, and it may already be dropped on sleep.
+        -- We can't use is_connected() here because during clamshell
+        -- transitions, the HDMI display link may not be visible to
+        -- hs.screen.find(). Instead, we use tv_was_connected which is
+        -- tracked by the screen watcher while the system is awake.
         if eventType == hs.caffeinate.watcher.screensDidWake or
            eventType == hs.caffeinate.watcher.systemDidWake or
            eventType == hs.caffeinate.watcher.screensDidUnlock then
-            self:handle_wake_event()
+            if self.tv_was_connected then
+                self:handle_wake_event()
+            else
+                log_debug("TV was not connected before sleep. Skipping wake.")
+            end
         elseif eventType == hs.caffeinate.watcher.screensDidSleep or
                eventType == hs.caffeinate.watcher.systemWillPowerOff then
-            self:handle_sleep_event()
+            if self.tv_was_connected then
+                self:handle_sleep_event()
+            else
+                log_debug("TV is not connected. Skipping sleep.")
+            end
         end
+    end)
+
+    -- Track HDMI connection state so we know whether the TV was
+    -- connected before sleep/wake transitions (when hs.screen.find()
+    -- is unreliable due to HDMI link timing).
+    self.screen_watcher = hs.screen.watcher.new(function()
+        local connected = self:is_connected()
+        log_debug("Screen configuration changed. TV connected: " .. tostring(connected))
+        self.tv_was_connected = connected
     end)
 
     self.audio_event_tap = hs.eventtap.new(
@@ -312,6 +330,7 @@ function LGTVController:start()
     self:log_init()
     print("Starting LGTV watcher...")
     self.watcher:start()
+    self.screen_watcher:start()
 
     if config.control_audio then
         print("Starting LGTV audio events watcher...")
