@@ -274,16 +274,16 @@ function LGTVController:setup_watchers()
             return
         end
 
-        -- Wake events run without checking is_connected() because during
-        -- clamshell wake, the HDMI display link hasn't been negotiated yet
-        -- and hs.screen.find() won't find the TV.
+        -- Skip is_connected() for both wake and sleep events because
+        -- during clamshell transitions, the HDMI display link may not be
+        -- visible to hs.screen.find() — it hasn't been negotiated yet on
+        -- wake, and it may already be dropped on sleep.
         if eventType == hs.caffeinate.watcher.screensDidWake or
            eventType == hs.caffeinate.watcher.systemDidWake or
            eventType == hs.caffeinate.watcher.screensDidUnlock then
             self:handle_wake_event()
-        elseif (eventType == hs.caffeinate.watcher.screensDidSleep or
-                eventType == hs.caffeinate.watcher.systemWillPowerOff) and
-               self:is_connected() then
+        elseif eventType == hs.caffeinate.watcher.screensDidSleep or
+               eventType == hs.caffeinate.watcher.systemWillPowerOff then
             self:handle_sleep_event()
         end
     end)
