@@ -13,6 +13,11 @@ local config = {
     disable_lgtv = false, -- Disable this script entirely by setting this to true
     -- You can also disable it by creating an empty file  at `~/.disable_lgtv`.
 
+    -- Govee backlight settings
+    govee_ip = "192.168.0.81",
+    govee_control_port = 4003,
+    govee_enabled = true, -- Toggle Govee backlight with TV
+
     -- You likely will not need to change anything below this line
     screen_off_command = "screen_off",
     key_file_path = "~/.aiopylgtv.sqlite",
@@ -158,6 +163,16 @@ function LGTVController:log_init()
     log_debug("------------------------------------------------------------\n\n")
 end
 
+-- Govee Control
+function LGTVController:govee_command(cmd, data)
+    if not config.govee_enabled or config.govee_ip == "" then return end
+    local json = hs.json.encode({msg = {cmd = cmd, data = data}})
+    local udp = hs.socket.udp.new()
+    udp:send(json, config.govee_ip, config.govee_control_port)
+    hs.timer.doAfter(0.5, function() udp:close() end)
+    log_debug("Govee command sent: " .. cmd .. " -> " .. json)
+end
+
 -- Event Handlers
 function LGTVController:ping_tv()
     local ping_cmd = "ping -c 1 -W 3000 " .. config.tv_ip .. " > /dev/null 2>&1"
@@ -172,6 +187,8 @@ function LGTVController:handle_wake_event()
         return
     end
     self.last_wake_execution = current_time
+
+    self:govee_command("turn", {value = 1})
 
     if config.before_wake_command then
         log_debug("Executing before wake command: " .. config.before_wake_command)
@@ -223,6 +240,8 @@ function LGTVController:handle_sleep_event()
         return
     end
     self.last_sleep_execution = current_time
+
+    self:govee_command("turn", {value = 0})
 
     local current_app = tostring(self:current_app_id())
 
