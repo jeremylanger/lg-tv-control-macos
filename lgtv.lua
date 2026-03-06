@@ -3,11 +3,11 @@ LGTVController.__index = LGTVController
 
 -- Configuration
 local config = {
-    tv_ip = "",
-    tv_mac_address = "",
-    tv_input = "HDMI_1", -- Input to which your Mac is connected
+    tv_ip = "192.168.0.80",
+    tv_mac_address = "6C:15:DB:7C:AC:E2",
+    tv_input = "HDMI_4", -- Input to which your Mac is connected
     switch_input_on_wake = true, -- When computer wakes, switch to `tv_input`
-    debug = false, -- Enable debug messages
+    debug = true, -- Enable debug messages
     control_audio = false, -- Control audio volume/mute with keyboard
     prevent_sleep_when_using_other_input = true, -- Prevent TV sleep if TV is on an input other than `tv_input`
     disable_lgtv = false, -- Disable this script entirely by setting this to true
@@ -19,15 +19,15 @@ local config = {
     govee_enabled = true, -- Toggle Govee backlight with TV
 
     -- You likely will not need to change anything below this line
-    screen_off_command = "screen_off",
+    screen_off_command = "power_off",
     key_file_path = "~/.aiopylgtv.sqlite",
     connected_tv_identifiers = {"LG TV", "LG TV SSCR2"},
     bin_path = "~/bin/bscpylgtvcommand",
     wakeonlan_path = "~/bin/wakeonlan",
-    app_id = "com.webos.app." .. ("HDMI_1"):lower():gsub("_", ""),
+    app_id = "com.webos.app." .. ("HDMI_4"):lower():gsub("_", ""),
     set_pc_mode_on_wake = true,
     tv_device_name = "Mac",
-    debounce_seconds = 10,
+    debounce_seconds = 30,
     before_sleep_command = nil,
     after_sleep_command = nil,
     before_wake_command = nil,
@@ -175,9 +175,17 @@ end
 
 -- Event Handlers
 function LGTVController:ping_tv()
-    local ping_cmd = "ping -c 1 -W 3000 " .. config.tv_ip .. " > /dev/null 2>&1"
-    log_debug("Pinging TV to wake network interface...")
-    hs.execute(ping_cmd)
+    local ping_cmd = "ping -c 1 -W 1 " .. config.tv_ip .. " > /dev/null 2>&1"
+    local _, _, _, rc = hs.execute(ping_cmd)
+    return rc == 0
+end
+
+function LGTVController:try_command(command)
+    local full_command = self.bin_cmd .. command
+    log_debug("Trying command: " .. full_command)
+    local output, _, _, rc = hs.execute(full_command)
+    if rc == 0 then return output end
+    return nil
 end
 
 function LGTVController:handle_wake_event()
@@ -195,27 +203,51 @@ function LGTVController:handle_wake_event()
         hs.execute(config.before_wake_command)
     end
 
+    -- Wait for Mac's network interface to come back up after deep sleep
+    -- before sending WOL. Without this, the packet goes nowhere.
+    log_debug("Waiting for Mac network interface...")
+    for i = 1, 10 do
+        local _, _, _, rc = hs.execute("ifconfig en0 | grep 'status: active' > /dev/null 2>&1")
+        if rc == 0 then
+            log_debug("Network interface ready (attempt " .. i .. ")")
+            break
+        end
+        log_debug("Network not ready (attempt " .. i .. "/10)")
+        hs.timer.usleep(1000000)
+    end
+
+    -- Send multiple WOL packets. After deep sleep, the first packet
+    -- may be lost due to ARP cache being stale.
     if config.tv_mac_address ~= "" then
         local command = config.wakeonlan_path .. " " .. config.tv_mac_address
-        hs.execute(command)
-        log_debug("Wake on LAN packet sent to " .. config.tv_mac_address)
+        for i = 1, 3 do
+            hs.execute(command)
+            log_debug("Wake on LAN packet " .. i .. "/3 sent to " .. config.tv_mac_address)
+            if i < 3 then hs.timer.usleep(500000) end
+        end
     end
 
-    -- Ping TV to wake its network interface and populate ARP cache.
-    -- LG TVs in standby have slow network response, causing "No route to host"
-    -- errors if the WebSocket connection is attempted too soon.
-    self:ping_tv()
-
-    if self:execute_command("turn_screen_on") then
-        log_debug("TV screen turned on")
+    -- Poll ping until the TV is reachable on the network.
+    for i = 1, 30 do
+        if self:ping_tv() then
+            log_debug("TV responded to ping (attempt " .. i .. ")")
+            break
+        end
+        log_debug("Ping attempt " .. i .. "/30 - no response")
     end
 
-    -- Wait for the TV to fully power on and complete HDMI handshake
-    -- before switching input. Without this delay, the TV may show
-    -- "NO INPUT" because the HDMI link isn't established yet.
-    hs.timer.usleep(3000000) -- 3 seconds
+    -- Poll turn_screen_on until webOS accepts WebSocket commands.
+    -- After power_off + WOL, the TV needs time to boot before it
+    -- can respond. After screen_off, this succeeds immediately.
+    for i = 1, 15 do
+        if self:try_command("turn_screen_on") then
+            log_debug("TV ready - screen on (attempt " .. i .. ")")
+            break
+        end
+        log_debug("WebSocket not ready (attempt " .. i .. "/15)")
+    end
 
-    if self:current_app_id() ~= config.app_id and config.switch_input_on_wake then
+    if config.switch_input_on_wake then
         if self:execute_command("launch_app " .. config.app_id) then
             log_debug("Switched TV input to " .. config.app_id)
         end
@@ -224,6 +256,23 @@ function LGTVController:handle_wake_event()
     if config.set_pc_mode_on_wake then
         if self:execute_command("set_device_info " .. config.tv_input .. " pc '" .. config.tv_device_name .. "'") then
             log_debug("Set TV to PC mode")
+        end
+    end
+
+    -- After power_off + WOL, the HDMI handshake may not be complete
+    -- by the time we switch input. Wait for macOS to detect the TV
+    -- as a display, then re-switch input if needed.
+    if config.switch_input_on_wake and not self:is_connected() then
+        log_debug("HDMI not detected yet, waiting for display connection...")
+        for i = 1, 20 do
+            hs.timer.usleep(1000000)
+            if self:is_connected() then
+                log_debug("HDMI connection detected (attempt " .. i .. ")")
+                self:execute_command("launch_app " .. config.app_id)
+                log_debug("Re-switched TV input to " .. config.app_id)
+                break
+            end
+            log_debug("Waiting for HDMI (attempt " .. i .. "/20)")
         end
     end
 
