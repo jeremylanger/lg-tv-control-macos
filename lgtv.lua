@@ -240,6 +240,7 @@ function LGTVController:handle_wake_event()
     -- returns true during synchronous polling loops.
     local phase = "ping"
     local attempt = 0
+    local max_attempts = 60
 
     local function poll()
         attempt = attempt + 1
@@ -248,9 +249,10 @@ function LGTVController:handle_wake_event()
             if self:ping_tv() then
                 log_debug("TV responded to ping (attempt " .. attempt .. ")")
                 phase = "screen_on"
+                attempt = 0
                 self.wake_timer = hs.timer.doAfter(0.5, poll)
-            elseif attempt < 60 then
-                log_debug("Ping attempt " .. attempt .. "/60 - no response")
+            elseif attempt < max_attempts then
+                log_debug("Ping attempt " .. attempt .. "/" .. max_attempts .. " - no response")
                 self.wake_timer = hs.timer.doAfter(1, poll)
             else
                 log_debug("Timed out waiting for TV ping")
@@ -261,9 +263,10 @@ function LGTVController:handle_wake_event()
             if self:try_command("turn_screen_on") then
                 log_debug("TV ready - screen on (attempt " .. attempt .. ")")
                 phase = "hdmi"
+                attempt = 0
                 self.wake_timer = hs.timer.doAfter(0.5, poll)
-            elseif attempt < 60 then
-                log_debug("WebSocket not ready (attempt " .. attempt .. "/60)")
+            elseif attempt < max_attempts then
+                log_debug("WebSocket not ready (attempt " .. attempt .. "/" .. max_attempts .. ")")
                 self.wake_timer = hs.timer.doAfter(1, poll)
             else
                 log_debug("Timed out waiting for WebSocket, switching input anyway")
@@ -274,8 +277,8 @@ function LGTVController:handle_wake_event()
             if self:is_connected() then
                 log_debug("HDMI connected (attempt " .. attempt .. "), switching input")
                 self:finish_wake()
-            elseif attempt < 60 then
-                log_debug("Waiting for HDMI signal (attempt " .. attempt .. "/60)")
+            elseif attempt < max_attempts then
+                log_debug("Waiting for HDMI signal (attempt " .. attempt .. "/" .. max_attempts .. ")")
                 self.wake_timer = hs.timer.doAfter(1, poll)
             else
                 log_debug("Timed out waiting for HDMI, switching input anyway")
@@ -325,6 +328,12 @@ function LGTVController:handle_sleep_event()
 
     self.last_sleep_execution = current_time
 
+    -- Cancel any in-progress async wake polling
+    if self.wake_timer then
+        self.wake_timer:stop()
+        self.wake_timer = nil
+    end
+
     self:govee_command("turn", {value = 0})
 
     local current_app = tostring(self:current_app_id())
@@ -349,6 +358,8 @@ function LGTVController:handle_sleep_event()
     self.is_powering_off = true
     if self:execute_command(config.screen_off_command) then
         log_debug("TV screen turned off with command: " .. config.screen_off_command)
+    else
+        self.is_powering_off = false
     end
 
     if config.after_sleep_command then
