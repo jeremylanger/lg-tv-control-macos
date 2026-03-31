@@ -66,7 +66,9 @@ function LGTVController:new()
     obj.bin_cmd = config.bin_path .. " -p " .. config.key_file_path .. " " .. config.tv_ip .. " "
     obj.last_wake_execution = 0
     obj.last_sleep_execution = 0
+    obj.last_wake_completed = 0
     obj.tv_was_connected = obj:is_connected()
+    obj.is_powering_off = false
     return obj
 end
 
@@ -195,6 +197,13 @@ function LGTVController:handle_wake_event()
         return
     end
     self.last_wake_execution = current_time
+    self.is_powering_off = false
+
+    -- Cancel any in-progress async wake polling
+    if self.wake_timer then
+        self.wake_timer:stop()
+        self.wake_timer = nil
+    end
 
     self:govee_command("turn", {value = 1})
 
@@ -203,8 +212,8 @@ function LGTVController:handle_wake_event()
         hs.execute(config.before_wake_command)
     end
 
-    -- Wait for Mac's network interface to come back up after deep sleep
-    -- before sending WOL. Without this, the packet goes nowhere.
+    -- Synchronous: wait for network + send WOL. This is fast (~3 seconds)
+    -- and must complete before we can do anything else.
     log_debug("Waiting for Mac network interface...")
     for i = 1, 10 do
         local _, _, _, rc = hs.execute("ifconfig en0 | grep 'status: active' > /dev/null 2>&1")
@@ -216,8 +225,6 @@ function LGTVController:handle_wake_event()
         hs.timer.usleep(1000000)
     end
 
-    -- Send multiple WOL packets. After deep sleep, the first packet
-    -- may be lost due to ARP cache being stale.
     if config.tv_mac_address ~= "" then
         local command = config.wakeonlan_path .. " " .. config.tv_mac_address
         for i = 1, 3 do
@@ -227,25 +234,61 @@ function LGTVController:handle_wake_event()
         end
     end
 
-    -- Poll ping until the TV is reachable on the network.
-    for i = 1, 30 do
-        if self:ping_tv() then
-            log_debug("TV responded to ping (attempt " .. i .. ")")
-            break
+    -- Everything after WOL is async so we don't block Hammerspoon's
+    -- run loop. Blocking it prevents macOS from processing display
+    -- configuration callbacks, which is why is_connected() never
+    -- returns true during synchronous polling loops.
+    local phase = "ping"
+    local attempt = 0
+
+    local function poll()
+        attempt = attempt + 1
+
+        if phase == "ping" then
+            if self:ping_tv() then
+                log_debug("TV responded to ping (attempt " .. attempt .. ")")
+                phase = "screen_on"
+                self.wake_timer = hs.timer.doAfter(0.5, poll)
+            elseif attempt < 60 then
+                log_debug("Ping attempt " .. attempt .. "/60 - no response")
+                self.wake_timer = hs.timer.doAfter(1, poll)
+            else
+                log_debug("Timed out waiting for TV ping")
+                self.wake_timer = nil
+            end
+
+        elseif phase == "screen_on" then
+            if self:try_command("turn_screen_on") then
+                log_debug("TV ready - screen on (attempt " .. attempt .. ")")
+                phase = "hdmi"
+                self.wake_timer = hs.timer.doAfter(0.5, poll)
+            elseif attempt < 60 then
+                log_debug("WebSocket not ready (attempt " .. attempt .. "/60)")
+                self.wake_timer = hs.timer.doAfter(1, poll)
+            else
+                log_debug("Timed out waiting for WebSocket, switching input anyway")
+                self:finish_wake()
+            end
+
+        elseif phase == "hdmi" then
+            if self:is_connected() then
+                log_debug("HDMI connected (attempt " .. attempt .. "), switching input")
+                self:finish_wake()
+            elseif attempt < 60 then
+                log_debug("Waiting for HDMI signal (attempt " .. attempt .. "/60)")
+                self.wake_timer = hs.timer.doAfter(1, poll)
+            else
+                log_debug("Timed out waiting for HDMI, switching input anyway")
+                self:finish_wake()
+            end
         end
-        log_debug("Ping attempt " .. i .. "/30 - no response")
     end
 
-    -- Poll turn_screen_on until webOS accepts WebSocket commands.
-    -- After power_off + WOL, the TV needs time to boot before it
-    -- can respond. After screen_off, this succeeds immediately.
-    for i = 1, 15 do
-        if self:try_command("turn_screen_on") then
-            log_debug("TV ready - screen on (attempt " .. i .. ")")
-            break
-        end
-        log_debug("WebSocket not ready (attempt " .. i .. "/15)")
-    end
+    self.wake_timer = hs.timer.doAfter(1, poll)
+end
+
+function LGTVController:finish_wake()
+    self.wake_timer = nil
 
     if config.switch_input_on_wake then
         if self:execute_command("launch_app " .. config.app_id) then
@@ -259,27 +302,12 @@ function LGTVController:handle_wake_event()
         end
     end
 
-    -- After power_off + WOL, the HDMI handshake may not be complete
-    -- by the time we switch input. Wait for macOS to detect the TV
-    -- as a display, then re-switch input if needed.
-    if config.switch_input_on_wake and not self:is_connected() then
-        log_debug("HDMI not detected yet, waiting for display connection...")
-        for i = 1, 20 do
-            hs.timer.usleep(1000000)
-            if self:is_connected() then
-                log_debug("HDMI connection detected (attempt " .. i .. ")")
-                self:execute_command("launch_app " .. config.app_id)
-                log_debug("Re-switched TV input to " .. config.app_id)
-                break
-            end
-            log_debug("Waiting for HDMI (attempt " .. i .. "/20)")
-        end
-    end
-
     if config.after_wake_command then
         log_debug("Executing after wake command: " .. config.after_wake_command)
         hs.execute(config.after_wake_command)
     end
+
+    self.last_wake_completed = os.time()
 end
 
 function LGTVController:handle_sleep_event()
@@ -288,6 +316,13 @@ function LGTVController:handle_sleep_event()
         log_debug("Skipping sleep execution - debounced.")
         return
     end
+    -- Don't sleep right after a wake completed - this catches transient
+    -- screensDidSleep events that macOS fires during display reconfiguration
+    if current_time - self.last_wake_completed < config.debounce_seconds then
+        log_debug("Skipping sleep execution - too soon after wake completed.")
+        return
+    end
+
     self.last_sleep_execution = current_time
 
     self:govee_command("turn", {value = 0})
@@ -309,6 +344,9 @@ function LGTVController:handle_sleep_event()
         hs.execute(config.before_sleep_command)
     end
 
+    -- Prevent screen watcher from clearing tv_was_connected when
+    -- WE are the ones powering off the TV
+    self.is_powering_off = true
     if self:execute_command(config.screen_off_command) then
         log_debug("TV screen turned off with command: " .. config.screen_off_command)
     end
@@ -371,7 +409,15 @@ function LGTVController:setup_watchers()
     self.screen_watcher = hs.screen.watcher.new(function()
         local connected = self:is_connected()
         log_debug("Screen configuration changed. TV connected: " .. tostring(connected))
-        self.tv_was_connected = connected
+        if connected then
+            self.tv_was_connected = true
+            self.is_powering_off = false
+        elseif not self.is_powering_off then
+            -- Only clear the flag if WE didn't cause the disconnect
+            self.tv_was_connected = false
+        else
+            log_debug("Ignoring TV disconnect - we powered it off")
+        end
     end)
 
     self.audio_event_tap = hs.eventtap.new(
